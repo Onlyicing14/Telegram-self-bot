@@ -365,8 +365,14 @@ def register(client, owner_id: int, tz_str: str):
     Messages starting with "." (dot commands) are always skipped.
     """
 
-    @client.on(events.NewMessage(outgoing=True))
-    async def ai_unified_handler(event):
+    async def _handle_ai_activation(event):
+        """Shared logic for both NewMessage and MessageEdited events.
+
+        Routing depends ONLY on: trigger detected + reply exists.
+        It must NOT depend on sender, out flag, or helper id.
+        All three reply cases are outgoing trigger messages that reply to
+        something: own message, helper-bot AI message, or a third-party user.
+        """
         if not is_owner(event, owner_id):
             return
 
@@ -392,27 +398,39 @@ def register(client, owner_id: int, tz_str: str):
             return
 
         remaining = words[1].strip() if len(words) > 1 else ""
-
-        # ── METHOD 1: Trigger Mode (has remaining text, no reply needed) ──
-        if remaining:
-            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
-            await _execute_ai(event, owner_id, remaining, first_word, tz_str)
-            return
-
-        # ── METHOD 2: Reply Mode (only trigger word sent, need a reply) ──
         is_reply = bool(getattr(event, "is_reply", False))
-        if not is_reply:
-            # Only the trigger word with no text and no reply — ignore silently
+
+        if is_reply:
+            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
+            prompt_text, reply_ctx, error_msg = await _extract_reply_context(event, client)
+
+            if error_msg:
+                if remaining:
+                    await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+                    return
+                try:
+                    await event.edit(_format_error(first_word, first_word, error_msg))
+                except Exception as exc:
+                    logger.warning("AI handler: failed to edit reply error: %s", exc)
+                return
+
+            await _execute_ai(
+                event, owner_id, prompt_text, first_word, tz_str,
+                reply_context=reply_ctx,
+            )
             return
 
-        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
-        prompt_text, reply_ctx, error_msg = await _extract_reply_context(event, client)
-
-        if error_msg:
-            try:
-                await event.edit(_format_error(first_word, first_word, error_msg))
-            except Exception as exc:
-                logger.warning("AI handler: failed to edit reply error: %s", exc)
+        # ── Trigger Mode (no reply) ──
+        if not remaining:
             return
 
-        await _execute_ai(event, owner_id, prompt_text, first_word, tz_str, reply_context=reply_ctx)
+        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
+        await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+
+    @client.on(events.NewMessage(outgoing=True))
+    async def ai_unified_handler(event):
+        await _handle_ai_activation(event)
+
+    @client.on(events.MessageEdited(outgoing=True))
+    async def ai_unified_edit_handler(event):
+        await _handle_ai_activation(event)
