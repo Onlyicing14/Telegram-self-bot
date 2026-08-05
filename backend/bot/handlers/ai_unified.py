@@ -6,7 +6,7 @@ TRIGGER MODE:
   prompt becomes "Hello".
 
 REPLY MODE:
-  Owner replies to any message and sends ONLY the trigger word
+  Owner replies to any message and sends the trigger word
   ("Nova" or "نوا") → the replied message becomes the prompt.
 
   If the owner replies and also writes extra text:
@@ -39,6 +39,7 @@ _tz_str: str = "UTC"
 _trigger_cache: dict[str, str] = {"en": "", "fa": "", "ts": 0.0}
 _CACHE_TTL = 30.0
 _AI_TIMEOUT = 60.0
+_REPLY_FETCH_TIMEOUT = 10.0
 
 
 def configure(engine, owner_id: int, tz_str: str) -> None:
@@ -155,6 +156,26 @@ def _humanize_error(error: str) -> str:
     return error[:200] if error else "Unknown error."
 
 
+def _detect_reply(event) -> bool:
+    """Robustly detect whether the event is a reply to another message.
+
+    Checks multiple Telethon attributes since is_reply may not always
+    be populated reliably across event types and Telethon versions.
+    """
+    if getattr(event, "is_reply", False):
+        return True
+    msg = getattr(event, "message", None)
+    if msg is None:
+        return False
+    reply_to = getattr(msg, "reply_to", None)
+    if reply_to is not None:
+        return True
+    reply_to_msg_id = getattr(msg, "reply_to_msg_id", 0)
+    if reply_to_msg_id:
+        return True
+    return False
+
+
 async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", str]:
     """Extract prompt text from a reply.
 
@@ -166,7 +187,13 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
 
     reply_msg = None
     try:
-        reply_msg = await event.get_reply_message()
+        reply_msg = await asyncio.wait_for(
+            event.get_reply_message(),
+            timeout=_REPLY_FETCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("AI handler: get_reply_message timed out after %ss", _REPLY_FETCH_TIMEOUT)
+        return "", ReplyContext(), "Timed out fetching the replied message."
     except Exception as exc:
         logger.warning("AI handler: could not fetch reply message: %s", exc)
         return "", ReplyContext(), f"Could not read the replied message: {exc}"
@@ -174,10 +201,8 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     if reply_msg is None:
         return "", ReplyContext(), "No replied message found. Reply to a message first."
 
-    # ── Classify media ──
     media_info = classify_message(reply_msg)
 
-    # ── Extract sender info ──
     sender_name = ""
     sender_id = 0
     try:
@@ -190,7 +215,6 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     except Exception:
         pass
 
-    # ── Chat info ──
     chat_title = ""
     chat_id = 0
     try:
@@ -201,7 +225,6 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     except Exception:
         pass
 
-    # ── Timestamp ──
     msg_timestamp = ""
     try:
         from datetime import timezone
@@ -213,15 +236,10 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     except Exception:
         pass
 
-    # ── Build the prompt text ──
-    # The replied message content becomes the prompt.
-    # If the owner also wrote extra text (after the trigger word),
-    # it gets appended.
     raw_text = event.raw_text or ""
     words = raw_text.split(None, 1)
     extra_text = words[1].strip() if len(words) > 1 else ""
 
-    # Build the base prompt from the replied message
     if media_info.is_text:
         base_prompt = media_info.text or ""
     else:
@@ -238,7 +256,6 @@ async def _extract_reply_context(event, client) -> tuple[str, "ReplyContext", st
     if not prompt_text:
         return "", ReplyContext(), "The replied message has no text content to use as a prompt."
 
-    # ── Build reply context ──
     reply_ctx = ReplyContext(
         exists=True,
         message_id=reply_msg.id or 0,
@@ -357,7 +374,7 @@ def register(client, owner_id: int, tz_str: str):
       Owner sends "Nova Hello" → trigger "Nova" stripped → prompt = "Hello"
 
     METHOD 2 — Reply Mode:
-      Owner replies to any message and sends ONLY the trigger word
+      Owner replies to any message and sends the trigger word
       ("Nova" or "نوا") → replied message becomes the prompt.
       If extra text is added after the trigger, it's appended to the
       replied message content.
@@ -373,59 +390,73 @@ def register(client, owner_id: int, tz_str: str):
         All three reply cases are outgoing trigger messages that reply to
         something: own message, helper-bot AI message, or a third-party user.
         """
-        if not is_owner(event, owner_id):
-            return
-
-        raw_text = event.raw_text or ""
-        if not raw_text:
-            return
-
-        if raw_text.startswith("."):
-            return
-
-        words = raw_text.split(None, 1)
-        if not words:
-            return
-
-        first_word = words[0]
-
-        trigger_en, trigger_fa = await _load_triggers(owner_id)
-        if not trigger_en and not trigger_fa:
-            return
-
-        from backend.ai.config_store import match_trigger
-        if not match_trigger(first_word, trigger_en, trigger_fa):
-            return
-
-        remaining = words[1].strip() if len(words) > 1 else ""
-        is_reply = bool(getattr(event, "is_reply", False))
-
-        if is_reply:
-            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
-            prompt_text, reply_ctx, error_msg = await _extract_reply_context(event, client)
-
-            if error_msg:
-                if remaining:
-                    await _execute_ai(event, owner_id, remaining, first_word, tz_str)
-                    return
-                try:
-                    await event.edit(_format_error(first_word, first_word, error_msg))
-                except Exception as exc:
-                    logger.warning("AI handler: failed to edit reply error: %s", exc)
+        try:
+            if not is_owner(event, owner_id):
                 return
 
-            await _execute_ai(
-                event, owner_id, prompt_text, first_word, tz_str,
-                reply_context=reply_ctx,
+            raw_text = event.raw_text or ""
+            if not raw_text:
+                return
+
+            if raw_text.startswith("."):
+                return
+
+            words = raw_text.split(None, 1)
+            if not words:
+                return
+
+            first_word = words[0]
+
+            trigger_en, trigger_fa = await _load_triggers(owner_id)
+            if not trigger_en and not trigger_fa:
+                return
+
+            from backend.ai.config_store import match_trigger
+            if not match_trigger(first_word, trigger_en, trigger_fa):
+                return
+
+            remaining = words[1].strip() if len(words) > 1 else ""
+            is_reply = _detect_reply(event)
+
+            logger.info(
+                "AI activation: trigger='%s' remaining='%s' is_reply=%s",
+                first_word, remaining[:50], is_reply,
             )
-            return
 
-        # ── Trigger Mode (no reply) ──
-        if not remaining:
-            return
+            if is_reply:
+                trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="reply")
+                prompt_text, reply_ctx, error_msg = await _extract_reply_context(event, client)
 
-        trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
-        await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+                if error_msg:
+                    logger.warning("AI handler: reply extraction failed: %s", error_msg)
+                    if remaining:
+                        logger.info("AI handler: falling back to trigger mode with remaining text")
+                        await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+                        return
+                    try:
+                        await event.edit(_format_error(first_word, first_word, error_msg))
+                    except Exception as exc:
+                        logger.warning("AI handler: failed to edit reply error: %s", exc)
+                    return
+
+                logger.info("AI handler: reply mode executing, prompt length=%d", len(prompt_text))
+                await _execute_ai(
+                    event, owner_id, prompt_text, first_word, tz_str,
+                    reply_context=reply_ctx,
+                )
+                return
+
+            if not remaining:
+                return
+
+            trace("AI_TRIGGER_MATCHED", trigger=first_word, mode="trigger")
+            await _execute_ai(event, owner_id, remaining, first_word, tz_str)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("AI activation handler crashed: %s", exc)
+            trace("AI_ACTIVATION_CRASH", error=str(exc))
 
     @client.on(events.NewMessage(outgoing=True))
     async def ai_unified_handler(event):
